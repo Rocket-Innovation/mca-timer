@@ -94,17 +94,29 @@ This service does NOT:
 - Trust internal components (no redundant validation)
 - Fail fast with descriptive errors
 
-**Project Structure**: Flat organization
+**Project Structure**: Flat organization, one endpoint per file
 ```
 src/
-├── main.rs              // Application entry point, server setup
-├── api.rs               // API route handlers
-├── models.rs            // Data structures and types
+├── main.rs              // Application entry point, server setup, router
+├── config.rs            // Environment configuration
+├── models.rs            // Shared data structures (Timer, TimerStatus, AppState, ApiResponse)
 ├── db.rs                // Database operations (SQLx queries)
 ├── scheduler.rs         // Timer polling and execution logic
 ├── callback.rs          // HTTP callback execution
-└── config.rs            // Environment configuration
+├── api_create_timer.rs  // POST /timers (CreateTimerRequest, handler)
+├── api_get_timer.rs     // GET /timers/:id (TimerDetailResponse, handler)
+├── api_list_timers.rs   // GET /timers (ListTimersResponse, query params, handler)
+├── api_update_timer.rs  // PUT /timers/:id (UpdateTimerRequest, handler)
+├── api_cancel_timer.rs  // DELETE /timers/:id (handler)
+├── api_health.rs        // GET /health (HealthResponse, handler)
+└── auth.rs              // Authentication middleware
 ```
+
+**File Organization**:
+- Each API endpoint in its own file with request/response structs and handler function
+- Shared models (Timer, TimerStatus, AppState, ApiResponse) in models.rs
+- Database queries remain centralized in db.rs
+- Clear separation of concerns, easy to locate endpoint code
 
 **Conventions**:
 - Use `snake_case` for variables, functions, modules
@@ -113,6 +125,15 @@ src/
 - Use `Result<T, AppError>` for fallible operations
 - Document complex business logic with inline comments
 - Keep functions under 50 lines where possible
+
+**API File Naming**:
+- Pattern: `api_{action}_{resource}.rs` (e.g., `api_create_timer.rs`, `api_list_timers.rs`)
+- Each file contains:
+  - Request struct (if needed): `{Action}{Resource}Request` (e.g., `CreateTimerRequest`)
+  - Response struct (if needed): `{Action}{Resource}Response` or use shared types
+  - Handler function: `{action}_{resource}` (e.g., `pub async fn create_timer(...)`)
+- Import shared types from `models.rs` (Timer, ApiResponse, AppState, etc.)
+- Import database functions from `db.rs`
 
 ## Data Models
 
@@ -163,7 +184,9 @@ CREATE INDEX idx_timers_created_at ON timers(created_at DESC);
 
 ### Rust Models
 
-**Timer Status Enum**:
+**Shared Models (in `models.rs`)**:
+
+These core types are shared across multiple modules:
 ```rust
 pub enum TimerStatus {
     Pending,      // Waiting for execute_at time
@@ -174,8 +197,12 @@ pub enum TimerStatus {
 }
 ```
 
-**API Request/Response Types**:
+**Endpoint-Specific Types**:
+
+These are defined in their respective API files (e.g., `CreateTimerRequest` in `api_create_timer.rs`):
+
 ```rust
+// In api_create_timer.rs
 pub struct CreateTimerRequest {
     pub execute_at: DateTime<Utc>,
     pub callback_url: String,
@@ -184,6 +211,7 @@ pub struct CreateTimerRequest {
     pub metadata: Option<Value>,
 }
 
+// In api_update_timer.rs
 pub struct UpdateTimerRequest {
     pub execute_at: Option<DateTime<Utc>>,
     pub callback_url: Option<String>,
@@ -192,6 +220,7 @@ pub struct UpdateTimerRequest {
     pub metadata: Option<Value>,
 }
 
+// In models.rs (shared across multiple endpoints)
 pub struct TimerResponse {
     pub id: Uuid,
     pub created_at: DateTime<Utc>,
@@ -201,6 +230,7 @@ pub struct TimerResponse {
     pub executed_at: Option<DateTime<Utc>>,
 }
 
+// In api_get_timer.rs
 pub struct TimerDetailResponse {
     pub id: Uuid,
     pub created_at: DateTime<Utc>,
@@ -215,6 +245,7 @@ pub struct TimerDetailResponse {
     pub metadata: Option<Value>,
 }
 
+// In api_list_timers.rs
 pub struct ListTimersResponse {
     pub timers: Vec<TimerResponse>,
     pub total: i64,
@@ -250,6 +281,15 @@ pub struct Timer {
 
 pub type TimerCache = Arc<RwLock<HashMap<Uuid, Timer>>>;
 ```
+
+**Summary of Type Locations**:
+- **models.rs (shared)**: TimerStatus, Timer, ApiResponse, AppState, TimerCache, TimerResponse
+- **api_create_timer.rs**: CreateTimerRequest, create_timer handler
+- **api_get_timer.rs**: TimerDetailResponse, get_timer handler
+- **api_list_timers.rs**: ListTimersResponse, list_timers handler (with query params)
+- **api_update_timer.rs**: UpdateTimerRequest, update_timer handler
+- **api_cancel_timer.rs**: cancel_timer handler (no custom types)
+- **api_health.rs**: Health check handler and response type
 
 ## Response Format
 
