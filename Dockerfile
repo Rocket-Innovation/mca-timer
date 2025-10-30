@@ -1,7 +1,7 @@
 # Multi-stage build for optimized image size
 
 # Stage 1: Build
-FROM rust:1.75-bookworm as builder
+FROM rust:1.90-bookworm as builder
 
 WORKDIR /app
 
@@ -30,7 +30,7 @@ WORKDIR /app
 COPY --from=builder /app/target/release/timer /app/timer
 
 # Expose port
-EXPOSE 3000
+EXPOSE 8080
 
 # Run the binary
 CMD ["/app/timer"]

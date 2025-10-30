@@ -10,7 +10,7 @@ use crate::config::Config;
 
 // Timer status enum
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq)]
-#[sqlx(type_name = "text")]
+#[sqlx(type_name = "VARCHAR", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum TimerStatus {
     Pending,

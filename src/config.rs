@@ -36,7 +36,7 @@ impl Config {
         let port = env::var("PORT")
             .ok()
             .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(3000);
+            .unwrap_or(8080);
 
         // Load optional RUST_LOG with default "info"
         let rust_log = env::var("RUST_LOG")

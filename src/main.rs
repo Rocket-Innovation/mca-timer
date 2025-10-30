@@ -50,7 +50,7 @@ async fn main() {
     // Step 3: Connect to database
     tracing::info!("Connecting to database...");
     let pool = PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(10)
         .connect(&config.database_url)
         .await
         .expect("Failed to connect to database");
