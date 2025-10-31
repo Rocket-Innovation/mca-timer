@@ -241,16 +241,14 @@ These are defined in their respective API files (e.g., `CreateTimerRequest` in `
 // In api_create_timer.rs
 pub struct CreateTimerRequest {
     pub execute_at: DateTime<Utc>,
-    pub callback_type: CallbackType,
-    pub callback_config: CallbackConfig,
+    pub callback: CallbackConfig,  // Single field with internally-tagged enum
     pub metadata: Option<Value>,
 }
 
 // In api_update_timer.rs
 pub struct UpdateTimerRequest {
     pub execute_at: Option<DateTime<Utc>>,
-    pub callback_type: Option<CallbackType>,
-    pub callback_config: Option<CallbackConfig>,
+    pub callback: Option<CallbackConfig>,  // Single optional field
     pub metadata: Option<Value>,
 }
 
@@ -410,52 +408,58 @@ async fn auth_middleware(
 **Required**:
 - `API_KEY` - Authentication key for API access (minimum 32 characters recommended)
 
-**Database Configuration** (required):
+**Database Configuration** (required, component-based):
 - `PG_HOST` - PostgreSQL server hostname (e.g., `localhost`)
 - `PG_PORT` - PostgreSQL server port (default: `5432`)
 - `PG_USER` - PostgreSQL username
 - `PG_PASSWORD` - PostgreSQL password
 - `PG_DB_NAME` - PostgreSQL database name
-- `DATABASE_URL` - Direct PostgreSQL connection URL (alternative to component-based config, for backward compatibility)
 
 **Optional**:
 - `PORT` - HTTP server port (default: `8080`)
 - `RUST_LOG` - Logging level (default: `info`)
 
 **NATS Configuration** (optional, enables NATS callbacks):
-- `NATS_HOST` - NATS server hostname (e.g., `localhost`)
+- `NATS_HOST` - NATS server hostname (required if using NATS, e.g., `localhost`)
 - `NATS_PORT` - NATS server port (default: `4222`)
-- `NATS_USER` - NATS username for authentication (optional)
-- `NATS_PASSWORD` - NATS password for authentication (optional)
-- `NATS_URL` - Direct NATS connection URL (alternative to component-based config, for backward compatibility)
+- `NATS_USER` - NATS username for authentication (optional, can be empty)
+- `NATS_PASSWORD` - NATS password for authentication (optional, can be empty)
 
 **Example `.env` file**:
 ```env
-# Database configuration (component-based, recommended)
+# Database configuration (required)
+#
+# Option 1: Direct connection URL (for backward compatibility)
+# DATABASE_URL=postgresql://timer:timer123@localhost:5432/timerdb
+#
+# Option 2: Component-based configuration (recommended)
 PG_HOST=localhost
 PG_PORT=5432
 PG_USER=timer
 PG_PASSWORD=timer123
 PG_DB_NAME=timerdb
 
-# Or use direct URL (backward compatibility)
-# DATABASE_URL=postgresql://timer:timer123@localhost:5432/timerdb
+# API key for authentication (required, minimum 32 characters)
+API_KEY=dev-api-key-change-in-production-min-32-chars
 
-# API key
-API_KEY=my-super-secret-api-key-at-least-32-chars-long
-
-# Server configuration
+# HTTP server port (optional, default: 8080)
 PORT=8080
+
+# Logging level (optional, default: info)
+# Options: trace, debug, info, warn, error
 RUST_LOG=info
 
-# NATS configuration (component-based, recommended)
+# NATS configuration (optional, enables NATS callbacks)
+# If not set, only HTTP callbacks are supported
+#
+# Option 1: Direct URL (for backward compatibility)
+# NATS_URL=nats://localhost:4222
+#
+# Option 2: Component-based configuration (recommended)
 NATS_HOST=localhost
 NATS_PORT=4222
 NATS_USER=
 NATS_PASSWORD=
-
-# Or use direct URL (backward compatibility)
-# NATS_URL=nats://localhost:4222
 ```
 
 **Hard-coded defaults** (not configurable in MVP):
@@ -484,8 +488,7 @@ Content-Type: application/json
 ```json
 {
     "execute_at": "2025-10-26T15:30:00Z",
-    "callback_type": "http",
-    "callback_config": {
+    "callback": {
         "type": "http",
         "url": "https://api.example.com/webhook",
         "headers": {
@@ -507,8 +510,7 @@ Content-Type: application/json
 ```json
 {
     "execute_at": "2025-10-26T15:30:00Z",
-    "callback_type": "nats",
-    "callback_config": {
+    "callback": {
         "type": "nats",
         "topic": "events.timer.triggered",
         "key": "user123",
@@ -529,14 +531,13 @@ Content-Type: application/json
 
 **Field Validations**:
 - `execute_at` (required): Must be ISO 8601 format, must be in the future
-- `callback_type` (required): Must be either "http" or "nats"
-- `callback_config` (required): Object structure depends on callback_type
-  - **For HTTP**:
+- `callback` (required): Object with `type` field determining callback configuration
+  - **For HTTP callbacks** (`type: "http"`):
     - `type` (required): Must be "http"
     - `url` (required): Must be valid HTTP/HTTPS URL
     - `headers` (optional): JSON object, keys must be valid HTTP header names
     - `payload` (optional): Any valid JSON value
-  - **For NATS**:
+  - **For NATS callbacks** (`type: "nats"`):
     - `type` (required): Must be "nats"
     - `topic` (required): NATS subject/topic string (e.g., "events.timer.triggered")
     - `key` (optional): Optional routing key for subject-based routing
@@ -577,8 +578,8 @@ Content-Type: application/json
 1. Validate authentication via API key
 2. Parse and validate request body
 3. Check that `execute_at` is in the future (> now + 5 seconds buffer)
-4. Validate callback_type is either "http" or "nats"
-5. Validate callback_config structure matches callback_type:
+4. Validate `callback.type` is either "http" or "nats"
+5. Validate callback configuration structure matches the type:
    - HTTP: Validate URL is well-formed HTTP/HTTPS
    - NATS: Validate topic is non-empty string
 6. Generate UUIDv7 for timer ID (time-sortable)
@@ -589,9 +590,9 @@ Content-Type: application/json
 - Timer IDs are auto-generated UUIDv7 (time-sortable, better for database indexes)
 - Minimum execution delay: 5 seconds from creation
 - Maximum execution delay: No limit (MVP)
-- callback_config stored as JSONB for flexibility
-- Each timer uses EITHER HTTP OR NATS, not both simultaneously
-- **NATS Connection**: If NATS callback is used but NATS_URL is not configured, timer creation fails with validation error
+- Callback configuration stored as JSONB for flexibility
+- Each timer uses EITHER HTTP OR NATS, not both simultaneously (determined by `callback.type` field)
+- **NATS Connection**: If NATS callback is used but NATS_HOST is not configured, timer creation fails with validation error
 - **Eventual Consistency**: Timer is persisted to PostgreSQL immediately, but appears in scheduler's in-memory cache within 30 seconds (next memory loader sync). For timers scheduled to execute within 30 seconds, there may be a delay of up to 30 seconds before execution starts. This is an acceptable trade-off for simpler design.
 
 ---
@@ -789,8 +790,7 @@ Content-Type: application/json
 ```json
 {
     "execute_at": "2025-10-26T16:00:00Z",
-    "callback_type": "http",
-    "callback_config": {
+    "callback": {
         "type": "http",
         "url": "https://api.example.com/new-webhook",
         "headers": {
@@ -847,8 +847,8 @@ Content-Type: application/json
 - Only pending timers can be updated
 - Partial updates supported (only include fields to change)
 - Cannot change timer ID or created_at
-- Can change callback_type from http to nats or vice versa
-- When updating callback_type, must also provide matching callback_config
+- Can change callback type from http to nats or vice versa by providing new `callback` object with different `type`
+- When updating callback configuration, must provide complete `callback` object with all required fields for that type
 - **Eventual Consistency**: Updates are persisted to PostgreSQL immediately, but scheduler's in-memory cache refreshes within 30 seconds. If timer is already cached and scheduled for near-term execution, the old version may execute before cache refresh.
 
 ---
@@ -1280,7 +1280,7 @@ The platform publishes NATS messages with the following configuration:
 
 - **Publishing Mode**: Fire-and-forget (async publish). The platform does NOT wait for acknowledgments from subscribers.
 
-- **Connection**: Uses shared NATS client connection established at application startup (configured via `NATS_URL` environment variable).
+- **Connection**: Uses shared NATS client connection established at application startup (configured via `NATS_HOST` and `NATS_PORT` environment variables, with optional `NATS_USER` and `NATS_PASSWORD` for authentication).
 
 **Success Criteria**:
 - NATS client successfully publishes message (no connection errors)
@@ -1329,8 +1329,9 @@ If automatic retries are needed in the future, they can be added as an optional 
 - No retry attempts - single execution per timer
 
 **Configuration Errors**:
-- Invalid DATABASE_URL: Panic on startup (fail fast)
+- Missing or invalid database configuration (PG_HOST, PG_USER, PG_PASSWORD, PG_DB_NAME): Panic on startup (fail fast)
 - Missing API_KEY: Panic on startup (fail fast)
+- API_KEY too short (<32 chars): Panic on startup (fail fast)
 
 ## Docker Setup
 
@@ -1413,7 +1414,7 @@ services:
       - "8222:8222"
     networks:
       - timer-network
-    command: ["-js", "-m", "8222"]
+    command: "-js -m 8222"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
       interval: 10s
@@ -1429,11 +1430,11 @@ services:
       PG_USER: timer
       PG_PASSWORD: timer123
       PG_DB_NAME: timerdb
-      API_KEY: dev-api-key-change-in-production
-      PORT: 8080
-      RUST_LOG: info
+      API_KEY: dev-api-key-change-in-production-min-32-chars
       NATS_HOST: nats
       NATS_PORT: 4222
+      PORT: 8080
+      RUST_LOG: info
     ports:
       - "8080:8080"
     depends_on:
@@ -1552,7 +1553,7 @@ serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 
 # UUID generation
-uuid = { version = "1.0", features = ["v7", "serde"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
 
 # HTTP client for callbacks
 reqwest = { version = "0.11", features = ["json"] }
@@ -1566,6 +1567,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Environment variables
 dotenvy = "0.15"
+urlencoding = "2.1"
+
+# Error handling
+anyhow = "1.0"
 ```
 
 ## Development Commands
@@ -1655,8 +1660,7 @@ curl -X POST http://localhost:8080/timers \
   -H "Content-Type: application/json" \
   -d '{
     "execute_at": "2025-10-26T16:00:00Z",
-    "callback_type": "http",
-    "callback_config": {
+    "callback": {
       "type": "http",
       "url": "https://webhook.site/your-unique-id",
       "payload": {
@@ -1676,8 +1680,7 @@ curl -X POST http://localhost:8080/timers \
   -H "Content-Type: application/json" \
   -d '{
     "execute_at": "2025-10-26T16:00:00Z",
-    "callback_type": "nats",
-    "callback_config": {
+    "callback": {
       "type": "nats",
       "topic": "events.timer.triggered",
       "key": "test-key-123",
@@ -1814,7 +1817,7 @@ Integration tests should cover the following scenarios:
 
 **Issue**: `sqlx::Error: error returned from database: relation "timers" does not exist`
 - **Solution**: Run migrations with `sqlx migrate run` or recreate database
-- **Check**: Verify `DATABASE_URL` is correct and database exists
+- **Check**: Verify database configuration (PG_HOST, PG_USER, PG_PASSWORD, PG_DB_NAME) is correct and database exists
 - **Command**: `docker-compose exec postgres psql -U timer -d timerdb -c "\dt"`
 
 **Issue**: Timer not executing at expected time
@@ -1844,7 +1847,7 @@ Integration tests should cover the following scenarios:
 - **Debugging**:
   1. Check PostgreSQL is running: `docker-compose ps postgres`
   2. Check network connectivity: `docker-compose exec timer ping postgres`
-  3. Verify DATABASE_URL: `docker-compose exec timer env | grep DATABASE_URL`
+  3. Verify database config: `docker-compose exec timer env | grep PG_`
 - **Solution**: Ensure `depends_on` and `healthcheck` configured in docker-compose.yml
 
 ## MVP Limitations
@@ -1909,10 +1912,8 @@ The application follows a sequential startup process to ensure all components ar
 1. Load Environment Variables
    │
    ├─ Read .env file (if exists)
-   ├─ Build DATABASE_URL from components or use direct URL
-   │  ├─ Check DATABASE_URL (direct URL, backward compatibility)
-   │  └─ Or build from PG_HOST, PG_PORT, PG_USER, PG_PASSWORD, PG_DB_NAME
-   ├─ Parse API_KEY (required)
+   ├─ Build DATABASE_URL from PG_HOST, PG_PORT, PG_USER, PG_PASSWORD, PG_DB_NAME (required)
+   ├─ Parse API_KEY (required, minimum 32 characters)
    ├─ Parse PORT (optional, default: 8080)
    └─ Parse RUST_LOG (optional, default: info)
    │
@@ -1949,11 +1950,13 @@ The application follows a sequential startup process to ensure all components ar
    ▼
 6. Connect to NATS (Optional)
    │
-   ├─ Build NATS URL from environment variables
-   │  ├─ Check NATS_URL (direct URL, backward compatibility)
-   │  └─ Or build from NATS_HOST, NATS_PORT, NATS_USER, NATS_PASSWORD
-   ├─ If configured: Connect to NATS server
-   ├─ Store shared client in AppState
+   ├─ Check if NATS_HOST is configured
+   ├─ If configured:
+   │  ├─ Build NATS URL from NATS_HOST and NATS_PORT
+   │  ├─ Create ConnectOptions builder
+   │  ├─ If NATS_USER and NATS_PASSWORD provided: Add authentication via .user_and_password()
+   │  ├─ Connect to NATS server using ConnectOptions API
+   │  └─ Store shared client (Arc<async_nats::Client>) in AppState
    └─ If not configured: Set nats_client to None (HTTP-only mode)
    │
    ▼
@@ -1993,7 +1996,7 @@ The application follows a sequential startup process to ensure all components ar
 
 - **Shared State**: The in-memory cache is wrapped in `Arc<RwLock<>>` for thread-safe access by scheduler tasks. API handlers do NOT interact with the cache - they only read/write to PostgreSQL. Only the Memory Loader task writes to cache, and the Execution task reads from it.
 
-- **NATS Connection**: The NATS client connection is optional. If `NATS_URL` is not configured, the application runs in HTTP-only mode. NATS timers created without NATS connection will fail validation at creation time. The NATS client is wrapped in `Arc<>` for thread-safe sharing across tasks.
+- **NATS Connection**: The NATS client connection is optional. If `NATS_HOST` is not configured, the application runs in HTTP-only mode. NATS timers created without NATS connection will fail validation at creation time. The NATS client is wrapped in `Arc<async_nats::Client>` for thread-safe sharing across tasks. Authentication is handled via the ConnectOptions API using `.user_and_password()` method when credentials are provided.
 
 ### Scheduler Implementation
 
