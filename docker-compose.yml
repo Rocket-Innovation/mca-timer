@@ -21,18 +21,36 @@ services:
       timeout: 5s
       retries: 5
 
+  nats:
+    image: nats:2.10-alpine
+    container_name: timer-nats
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    networks:
+      - timer-network
+    command: "-js -m 8222"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   timer:
     build: .
     container_name: timer-platform
     environment:
       DATABASE_URL: postgresql://timer:timer123@postgres:5432/timerdb
       API_KEY: dev-api-key-change-in-production-min-32-chars
-      PORT: 3000
+      NATS_URL: nats://nats:4222
+      PORT: 8080
       RUST_LOG: info
     ports:
-      - "3000:3000"
+      - "8080:8080"
     depends_on:
       postgres:
+        condition: service_healthy
+      nats:
         condition: service_healthy
     networks:
       - timer-network

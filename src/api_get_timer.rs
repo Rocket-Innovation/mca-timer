@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::{
     db,
-    models::{ApiResponse, AppState},
+    models::{ApiResponse, AppState, CallbackConfig},
 };
 
 #[derive(Debug, Serialize)]
@@ -19,9 +19,7 @@ pub struct TimerDetailResponse {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub execute_at: DateTime<Utc>,
-    pub callback_url: String,
-    pub callback_headers: Option<serde_json::Value>,
-    pub callback_payload: Option<serde_json::Value>,
+    pub callback: CallbackConfig,
     pub status: String,
     pub last_error: Option<String>,
     pub executed_at: Option<DateTime<Utc>>,
@@ -42,9 +40,7 @@ pub async fn get_timer(
                 created_at: timer.created_at,
                 updated_at: timer.updated_at,
                 execute_at: timer.execute_at,
-                callback_url: timer.callback_url,
-                callback_headers: timer.callback_headers,
-                callback_payload: timer.callback_payload,
+                callback: timer.callback_config,
                 status: timer.status.to_string(),
                 last_error: timer.last_error,
                 executed_at: timer.executed_at,

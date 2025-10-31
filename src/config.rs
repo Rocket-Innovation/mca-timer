@@ -7,6 +7,8 @@ pub struct Config {
     pub api_key: String,
     pub port: u16,
     pub rust_log: String,
+    /// Optional NATS URL for pub/sub callbacks (None if NATS not configured)
+    pub nats_url: Option<String>,
 }
 
 impl Config {
@@ -42,11 +44,15 @@ impl Config {
         let rust_log = env::var("RUST_LOG")
             .unwrap_or_else(|_| "info".to_string());
 
+        // Load optional NATS_URL (None if not configured)
+        let nats_url = env::var("NATS_URL").ok();
+
         Ok(Config {
             database_url,
             api_key,
             port,
             rust_log,
+            nats_url,
         })
     }
 

@@ -5,15 +5,13 @@ use std::sync::Arc;
 
 use crate::{
     db,
-    models::{ApiResponse, AppState, TimerResponse},
+    models::{ApiResponse, AppState, CallbackConfig, CallbackType, TimerResponse},
 };
 
 #[derive(Debug, Deserialize)]
 pub struct CreateTimerRequest {
     pub execute_at: chrono::DateTime<Utc>,
-    pub callback_url: String,
-    pub callback_headers: Option<serde_json::Value>,
-    pub callback_payload: Option<serde_json::Value>,
+    pub callback: CallbackConfig,
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -38,24 +36,55 @@ pub async fn create_timer(
         ));
     }
 
-    // Validate callback_url starts with http:// or https://
-    if !req.callback_url.starts_with("http://") && !req.callback_url.starts_with("https://") {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<()>::error(
-                2,
-                "callback_url must start with http:// or https://",
-            )),
-        ));
+    // Validate callback configuration
+    match &req.callback {
+        CallbackConfig::Http(http) => {
+            if !http.url.starts_with("http://") && !http.url.starts_with("https://") {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse::<()>::error(
+                        2,
+                        "HTTP callback URL must start with http:// or https://",
+                    )),
+                ));
+            }
+        }
+        CallbackConfig::Nats(nats) => {
+            // Validate NATS is available if requested
+            if state.nats_client.is_none() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse::<()>::error(
+                        2,
+                        "NATS callbacks not available (NATS_URL not configured)",
+                    )),
+                ));
+            }
+            // Validate topic is not empty
+            if nats.topic.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse::<()>::error(
+                        2,
+                        "NATS topic cannot be empty",
+                    )),
+                ));
+            }
+        }
     }
+
+    // Determine callback_type
+    let callback_type = match &req.callback {
+        CallbackConfig::Http(_) => CallbackType::Http,
+        CallbackConfig::Nats(_) => CallbackType::Nats,
+    };
 
     // Create timer in database
     match db::db_create_timer(
         &state.pool,
         req.execute_at,
-        req.callback_url,
-        req.callback_headers,
-        req.callback_payload,
+        callback_type,
+        req.callback,
         req.metadata,
     )
     .await

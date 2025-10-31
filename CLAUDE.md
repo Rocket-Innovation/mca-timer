@@ -5,7 +5,7 @@
 - **Timer Registration**: Accept and validate timer creation requests via RESTful API
 - **Timer Storage**: Persist timer configurations, callback URLs, and payloads in PostgreSQL
 - **Timer Scheduling**: Monitor registered timers and trigger callbacks at specified execution times
-- **Callback Delivery**: Execute HTTP callbacks to external platforms with payload data (single attempt)
+- **Callback Delivery**: Execute HTTP or NATS callbacks to external platforms with payload data (single attempt)
 - **Timer Management**: Support listing, updating, canceling, and querying timer status
 
 This service does NOT:
@@ -23,7 +23,8 @@ This service does NOT:
 - **PostgreSQL** 15+ - Persistent storage for timer configurations
 - **SQLx** 0.7 - Type-safe database interactions with compile-time query checking
 - **Tokio** 1.x - Async runtime (full feature set) for non-blocking I/O
-- **Reqwest** 0.11 - HTTP client for triggering callbacks
+- **Reqwest** 0.11 - HTTP client for triggering HTTP callbacks
+- **async-nats** 0.33 - NATS client for pub/sub callbacks
 - **Chrono** 0.4 - Date/time handling with timezone support
 - **UUID** 1.0 - UUIDv7 for globally unique, time-sortable timer IDs
 - **Tracing** - Structured logging for observability
@@ -76,12 +77,12 @@ This service does NOT:
 │                                                                   │
 └─────────────────────────────────────────────────────────────────┘
                           │
-                          │ HTTP Callbacks
+                          │ HTTP or NATS Callbacks
                           ▼
-                ┌──────────────────┐
-                │ External Services │
-                │  (Webhooks)       │
-                └──────────────────┘
+                ┌──────────────────────────────┐
+                │ External Services            │
+                │  (Webhooks or NATS Consumers)│
+                └──────────────────────────────┘
 ```
 
 ## Coding Styles
@@ -99,10 +100,12 @@ This service does NOT:
 src/
 ├── main.rs              // Application entry point, server setup, router
 ├── config.rs            // Environment configuration
-├── models.rs            // Shared data structures (Timer, TimerStatus, AppState, ApiResponse)
+├── models.rs            // Shared data structures (Timer, TimerStatus, AppState, ApiResponse, CallbackType)
 ├── db.rs                // Database operations (SQLx queries)
 ├── scheduler.rs         // Timer polling and execution logic
-├── callback.rs          // HTTP callback execution
+├── callback.rs          // Unified callback execution (HTTP and NATS)
+├── callback_http.rs     // HTTP callback implementation
+├── callback_nats.rs     // NATS callback implementation
 ├── api_create_timer.rs  // POST /timers (CreateTimerRequest, handler)
 ├── api_get_timer.rs     // GET /timers/:id (TimerDetailResponse, handler)
 ├── api_list_timers.rs   // GET /timers (ListTimersResponse, query params, handler)
@@ -146,13 +149,14 @@ CREATE TABLE timers (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     execute_at TIMESTAMPTZ NOT NULL,
-    callback_url TEXT NOT NULL,
-    callback_headers JSONB,
-    callback_payload JSONB,
+    callback_type VARCHAR(10) NOT NULL DEFAULT 'http',
+    callback_config JSONB NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'pending',
     last_error TEXT,
     executed_at TIMESTAMPTZ,
-    metadata JSONB
+    metadata JSONB,
+
+    CONSTRAINT valid_callback_type CHECK (callback_type IN ('http', 'nats'))
 );
 
 CREATE INDEX idx_timers_execute_at_status ON timers(execute_at, status)
@@ -160,6 +164,7 @@ CREATE INDEX idx_timers_execute_at_status ON timers(execute_at, status)
 
 CREATE INDEX idx_timers_status ON timers(status);
 CREATE INDEX idx_timers_created_at ON timers(created_at DESC);
+CREATE INDEX idx_timers_callback_type ON timers(callback_type);
 ```
 
 **Field Descriptions**:
@@ -167,15 +172,19 @@ CREATE INDEX idx_timers_created_at ON timers(created_at DESC);
 - `created_at`: Timer creation timestamp (UTC)
 - `updated_at`: Last modification timestamp (UTC)
 - `execute_at`: When callback should be triggered (UTC)
-- `callback_url`: Full HTTP(S) URL for callback destination
-- `callback_headers`: Optional JSON object of custom headers
-- `callback_payload`: JSON payload to send in callback body
+- `callback_type`: Type of callback - `http` or `nats`
+- `callback_config`: JSONB object containing callback configuration (structure depends on callback_type)
+  - **For HTTP**: `{"url": "https://...", "headers": {...}, "payload": {...}}`
+  - **For NATS**: `{"topic": "events.timer", "key": "optional-key", "headers": {...}, "payload": {...}}`
 - `status`: Current state - `pending`, `executing`, `completed`, `failed`, `canceled`
 - `last_error`: Error message if callback failed (NULL on success)
 - `executed_at`: Timestamp when callback execution completed (success or failure, NULL if not yet executed)
 - `metadata`: Optional JSON object for client reference data
 
-**Note**: All callbacks use HTTP POST method (hardcoded)
+**Callback Type Details**:
+
+- **HTTP Callbacks**: Use HTTP POST method (hardcoded) to send JSON payload to specified URL
+- **NATS Callbacks**: Publish JSON payload to NATS topic, optional key for subject-based routing
 
 **Indexes**:
 - Composite index on `(execute_at, status)` for efficient scheduler queries
@@ -195,6 +204,33 @@ pub enum TimerStatus {
     Failed,       // Callback failed (no retry)
     Canceled,     // Manually canceled by user
 }
+
+pub enum CallbackType {
+    Http,
+    Nats,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HTTPCallback {
+    pub url: String,
+    pub headers: Option<serde_json::Value>,
+    pub payload: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NATSCallback {
+    pub topic: String,
+    pub key: Option<String>,
+    pub headers: Option<serde_json::Value>,
+    pub payload: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum CallbackConfig {
+    Http(HTTPCallback),
+    Nats(NATSCallback),
+}
 ```
 
 **Endpoint-Specific Types**:
@@ -205,18 +241,16 @@ These are defined in their respective API files (e.g., `CreateTimerRequest` in `
 // In api_create_timer.rs
 pub struct CreateTimerRequest {
     pub execute_at: DateTime<Utc>,
-    pub callback_url: String,
-    pub callback_headers: Option<HashMap<String, String>>,
-    pub callback_payload: Option<Value>,
+    pub callback_type: CallbackType,
+    pub callback_config: CallbackConfig,
     pub metadata: Option<Value>,
 }
 
 // In api_update_timer.rs
 pub struct UpdateTimerRequest {
     pub execute_at: Option<DateTime<Utc>>,
-    pub callback_url: Option<String>,
-    pub callback_headers: Option<HashMap<String, String>>,
-    pub callback_payload: Option<Value>,
+    pub callback_type: Option<CallbackType>,
+    pub callback_config: Option<CallbackConfig>,
     pub metadata: Option<Value>,
 }
 
@@ -225,7 +259,7 @@ pub struct TimerResponse {
     pub id: Uuid,
     pub created_at: DateTime<Utc>,
     pub execute_at: DateTime<Utc>,
-    pub callback_url: String,
+    pub callback_type: String,
     pub status: String,
     pub executed_at: Option<DateTime<Utc>>,
 }
@@ -236,9 +270,8 @@ pub struct TimerDetailResponse {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub execute_at: DateTime<Utc>,
-    pub callback_url: String,
-    pub callback_headers: Option<HashMap<String, String>>,
-    pub callback_payload: Option<Value>,
+    pub callback_type: String,
+    pub callback_config: CallbackConfig,
     pub status: String,
     pub last_error: Option<String>,
     pub executed_at: Option<DateTime<Utc>>,
@@ -263,6 +296,7 @@ pub struct AppState {
     pub pool: PgPool,
     pub config: Config,
     pub timer_cache: TimerCache,
+    pub nats_client: Option<NatsClient>,
 }
 
 pub struct Timer {
@@ -270,9 +304,8 @@ pub struct Timer {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub execute_at: DateTime<Utc>,
-    pub callback_url: String,
-    pub callback_headers: Option<HashMap<String, String>>,
-    pub callback_payload: Option<Value>,
+    pub callback_type: CallbackType,
+    pub callback_config: CallbackConfig,
     pub status: TimerStatus,
     pub last_error: Option<String>,
     pub executed_at: Option<DateTime<Utc>>,
@@ -280,10 +313,11 @@ pub struct Timer {
 }
 
 pub type TimerCache = Arc<RwLock<HashMap<Uuid, Timer>>>;
+pub type NatsClient = Arc<async_nats::Client>;
 ```
 
 **Summary of Type Locations**:
-- **models.rs (shared)**: TimerStatus, Timer, ApiResponse, AppState, TimerCache, TimerResponse
+- **models.rs (shared)**: TimerStatus, CallbackType, CallbackConfig, HTTPCallback, NATSCallback, Timer, ApiResponse, AppState, TimerCache, TimerResponse, NatsClient
 - **api_create_timer.rs**: CreateTimerRequest, create_timer handler
 - **api_get_timer.rs**: TimerDetailResponse, get_timer handler
 - **api_list_timers.rs**: ListTimersResponse, list_timers handler (with query params)
@@ -378,15 +412,17 @@ async fn auth_middleware(
 - `API_KEY` - Authentication key for API access (minimum 32 characters recommended)
 
 **Optional**:
-- `PORT` - HTTP server port (default: `3000`)
+- `PORT` - HTTP server port (default: `8080`)
 - `RUST_LOG` - Logging level (default: `info`)
+- `NATS_URL` - NATS server connection string (default: `nats://localhost:4222`). Required only if NATS callbacks are used.
 
 **Example `.env` file**:
 ```env
 DATABASE_URL=postgresql://timer:timer123@localhost:5432/timerdb
 API_KEY=my-super-secret-api-key-at-least-32-chars-long
-PORT=3000
+PORT=8080
 RUST_LOG=info
+NATS_URL=nats://localhost:4222
 ```
 
 **Hard-coded defaults** (not configurable in MVP):
@@ -411,18 +447,46 @@ X-API-Key: your-api-key
 Content-Type: application/json
 ```
 
-**Request Body**:
+**Request Body (HTTP Callback)**:
 ```json
 {
     "execute_at": "2025-10-26T15:30:00Z",
-    "callback_url": "https://api.example.com/webhook",
-    "callback_headers": {
-        "Authorization": "Bearer token123",
-        "X-Custom-Header": "value"
+    "callback_type": "http",
+    "callback_config": {
+        "type": "http",
+        "url": "https://api.example.com/webhook",
+        "headers": {
+            "Authorization": "Bearer token123",
+            "X-Custom-Header": "value"
+        },
+        "payload": {
+            "event": "timer_triggered",
+            "user_id": "user123"
+        }
     },
-    "callback_payload": {
-        "event": "timer_triggered",
-        "user_id": "user123"
+    "metadata": {
+        "client_ref": "order-456"
+    }
+}
+```
+
+**Request Body (NATS Callback)**:
+```json
+{
+    "execute_at": "2025-10-26T15:30:00Z",
+    "callback_type": "nats",
+    "callback_config": {
+        "type": "nats",
+        "topic": "events.timer.triggered",
+        "key": "user123",
+        "headers": {
+            "X-Event-Type": "timer_triggered",
+            "X-Source": "timer-platform"
+        },
+        "payload": {
+            "event": "timer_triggered",
+            "user_id": "user123"
+        }
     },
     "metadata": {
         "client_ref": "order-456"
@@ -432,12 +496,24 @@ Content-Type: application/json
 
 **Field Validations**:
 - `execute_at` (required): Must be ISO 8601 format, must be in the future
-- `callback_url` (required): Must be valid HTTP/HTTPS URL
-- `callback_headers` (optional): JSON object, keys must be valid HTTP header names
-- `callback_payload` (optional): Any valid JSON value
+- `callback_type` (required): Must be either "http" or "nats"
+- `callback_config` (required): Object structure depends on callback_type
+  - **For HTTP**:
+    - `type` (required): Must be "http"
+    - `url` (required): Must be valid HTTP/HTTPS URL
+    - `headers` (optional): JSON object, keys must be valid HTTP header names
+    - `payload` (optional): Any valid JSON value
+  - **For NATS**:
+    - `type` (required): Must be "nats"
+    - `topic` (required): NATS subject/topic string (e.g., "events.timer.triggered")
+    - `key` (optional): Optional routing key for subject-based routing
+    - `headers` (optional): JSON object for NATS message headers
+    - `payload` (optional): Any valid JSON value
 - `metadata` (optional): Any valid JSON value for client reference
 
-**Note**: All callbacks use HTTP POST method (hardcoded, not configurable)
+**Note**:
+- HTTP callbacks use HTTP POST method (hardcoded, not configurable)
+- NATS callbacks are fire-and-forget publishes (no response expected)
 
 **Success Response** (HTTP 201):
 ```json
@@ -448,7 +524,7 @@ Content-Type: application/json
         "id": "550e8400-e29b-41d4-a716-446655440000",
         "created_at": "2025-10-26T10:30:00Z",
         "execute_at": "2025-10-26T15:30:00Z",
-        "callback_url": "https://api.example.com/webhook",
+        "callback_type": "http",
         "status": "pending",
         "executed_at": null
     }
@@ -468,16 +544,21 @@ Content-Type: application/json
 1. Validate authentication via API key
 2. Parse and validate request body
 3. Check that `execute_at` is in the future (> now + 5 seconds buffer)
-4. Validate callback_url is well-formed HTTP/HTTPS URL
-5. Generate UUIDv7 for timer ID (time-sortable)
-6. Insert record into `timers` table with status='pending'
-7. Return created timer details
+4. Validate callback_type is either "http" or "nats"
+5. Validate callback_config structure matches callback_type:
+   - HTTP: Validate URL is well-formed HTTP/HTTPS
+   - NATS: Validate topic is non-empty string
+6. Generate UUIDv7 for timer ID (time-sortable)
+7. Insert record into `timers` table with status='pending'
+8. Return created timer details
 
 **Notes**:
 - Timer IDs are auto-generated UUIDv7 (time-sortable, better for database indexes)
 - Minimum execution delay: 5 seconds from creation
 - Maximum execution delay: No limit (MVP)
-- callback_headers stored as JSONB for flexibility
+- callback_config stored as JSONB for flexibility
+- Each timer uses EITHER HTTP OR NATS, not both simultaneously
+- **NATS Connection**: If NATS callback is used but NATS_URL is not configured, timer creation fails with validation error
 - **Eventual Consistency**: Timer is persisted to PostgreSQL immediately, but appears in scheduler's in-memory cache within 30 seconds (next memory loader sync). For timers scheduled to execute within 30 seconds, there may be a delay of up to 30 seconds before execution starts. This is an acceptable trade-off for simpler design.
 
 ---
@@ -497,7 +578,7 @@ X-API-Key: your-api-key
 **Path Parameters**:
 - `id`: UUID of the timer
 
-**Success Response** (HTTP 200):
+**Success Response (HTTP Callback)** (HTTP 200):
 ```json
 {
     "code": 0,
@@ -507,12 +588,49 @@ X-API-Key: your-api-key
         "created_at": "2025-10-26T10:30:00Z",
         "updated_at": "2025-10-26T10:30:00Z",
         "execute_at": "2025-10-26T15:30:00Z",
-        "callback_url": "https://api.example.com/webhook",
-        "callback_headers": {
-            "Authorization": "Bearer token123"
+        "callback_type": "http",
+        "callback_config": {
+            "type": "http",
+            "url": "https://api.example.com/webhook",
+            "headers": {
+                "Authorization": "Bearer token123"
+            },
+            "payload": {
+                "event": "timer_triggered"
+            }
         },
-        "callback_payload": {
-            "event": "timer_triggered"
+        "status": "pending",
+        "last_error": null,
+        "executed_at": null,
+        "metadata": {
+            "client_ref": "order-456"
+        }
+    }
+}
+```
+
+**Success Response (NATS Callback)** (HTTP 200):
+```json
+{
+    "code": 0,
+    "message": "success",
+    "data": {
+        "id": "550e8400-e29b-41d4-a716-446655440001",
+        "created_at": "2025-10-26T10:30:00Z",
+        "updated_at": "2025-10-26T10:30:00Z",
+        "execute_at": "2025-10-26T15:30:00Z",
+        "callback_type": "nats",
+        "callback_config": {
+            "type": "nats",
+            "topic": "events.timer.triggered",
+            "key": "user123",
+            "headers": {
+                "X-Event-Type": "timer_triggered"
+            },
+            "payload": {
+                "event": "timer_triggered",
+                "user_id": "user123"
+            }
         },
         "status": "pending",
         "last_error": null,
@@ -542,6 +660,7 @@ X-API-Key: your-api-key
 
 **Notes**:
 - Returns complete timer configuration including sensitive data (callback headers)
+- Response structure varies based on callback_type (http vs nats)
 - No filtering or redaction of fields in MVP
 
 ---
@@ -581,12 +700,20 @@ GET /timers?status=pending&limit=20&offset=0&sort=execute_at&order=asc
                 "id": "550e8400-e29b-41d4-a716-446655440000",
                 "created_at": "2025-10-26T10:30:00Z",
                 "execute_at": "2025-10-26T15:30:00Z",
-                "callback_url": "https://api.example.com/webhook",
+                "callback_type": "http",
+                "status": "pending",
+                "executed_at": null
+            },
+            {
+                "id": "550e8400-e29b-41d4-a716-446655440001",
+                "created_at": "2025-10-26T10:31:00Z",
+                "execute_at": "2025-10-26T16:00:00Z",
+                "callback_type": "nats",
                 "status": "pending",
                 "executed_at": null
             }
         ],
-        "total": 1,
+        "total": 2,
         "limit": 20,
         "offset": 0
     }
@@ -603,8 +730,9 @@ GET /timers?status=pending&limit=20&offset=0&sort=execute_at&order=asc
 
 **Notes**:
 - Default sort: most recent first (created_at DESC)
-- Does not include full timer details (callback_headers, callback_payload, metadata excluded)
+- Does not include full timer details (callback_config, metadata excluded, only callback_type shown)
 - Total count may be cached/estimated for performance (MVP uses exact COUNT)
+- List includes both HTTP and NATS timers, distinguished by callback_type field
 
 ---
 
@@ -628,12 +756,16 @@ Content-Type: application/json
 ```json
 {
     "execute_at": "2025-10-26T16:00:00Z",
-    "callback_url": "https://api.example.com/new-webhook",
-    "callback_headers": {
-        "Authorization": "Bearer newtoken"
-    },
-    "callback_payload": {
-        "event": "updated_event"
+    "callback_type": "http",
+    "callback_config": {
+        "type": "http",
+        "url": "https://api.example.com/new-webhook",
+        "headers": {
+            "Authorization": "Bearer newtoken"
+        },
+        "payload": {
+            "event": "updated_event"
+        }
     },
     "metadata": {
         "updated": true
@@ -651,7 +783,7 @@ Content-Type: application/json
         "created_at": "2025-10-26T10:30:00Z",
         "updated_at": "2025-10-26T11:00:00Z",
         "execute_at": "2025-10-26T16:00:00Z",
-        "callback_url": "https://api.example.com/new-webhook",
+        "callback_type": "http",
         "status": "pending",
         "executed_at": null
     }
@@ -682,6 +814,8 @@ Content-Type: application/json
 - Only pending timers can be updated
 - Partial updates supported (only include fields to change)
 - Cannot change timer ID or created_at
+- Can change callback_type from http to nats or vice versa
+- When updating callback_type, must also provide matching callback_config
 - **Eventual Consistency**: Updates are persisted to PostgreSQL immediately, but scheduler's in-memory cache refreshes within 30 seconds. If timer is already cached and scheduled for near-term execution, the old version may execute before cache refresh.
 
 ---
@@ -1002,7 +1136,7 @@ This design prioritizes simplicity over instant consistency:
 
 **Callback Execution Flow**:
 
-When a timer's `execute_at` time is reached, the scheduler spawns an asynchronous task to execute the HTTP callback to the external service.
+When a timer's `execute_at` time is reached, the scheduler spawns an asynchronous task to execute the callback. The execution logic branches based on the timer's `callback_type` (HTTP or NATS).
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -1016,76 +1150,80 @@ When a timer's `execute_at` time is reached, the scheduler spawns an asynchronou
   └────────┬────────┘
            │
            ▼
-  ┌─────────────────────────────────────┐
-  │ Build HTTP Request:                 │
-  │                                     │
-  │ Method: POST (hardcoded)            │
-  │ URL: callback_url                   │
-  │ Headers:                            │
-  │   - Content-Type: application/json  │
-  │   - User-Agent: timer-platform/0.1.0│
-  │   - Custom headers from DB          │
-  │ Body: callback_payload (JSON)       │
-  │ Timeout: 30 seconds                 │
-  └────────┬────────────────────────────┘
-           │
-           ▼
-  ┌─────────────────┐
-  │ Send HTTP       │
-  │ Request         │
-  │ (async)         │
-  └────────┬────────┘
-           │
-           ▼
-  ┌────────────────────────────┐
-  │ Wait for Response          │
-  │ (max 30s timeout)          │
-  └────────┬───────────────────┘
-           │
+  ┌────────────────────┐
+  │ Check callback_type│
+  └────────┬───────────┘
            │
     ┌──────┴──────┐
     │             │
     ▼             ▼
-┌─────────┐  ┌──────────────┐
-│HTTP 2xx │  │HTTP 4xx/5xx  │
-│Success  │  │Network Error │
-│         │  │Timeout       │
-└────┬────┘  └──────┬───────┘
-     │              │
-     │              ▼
-     │       ┌────────────────┐
-     │       │ Mark as FAILED │
-     │       │                │
-     │       │ Store error    │
-     │       │ message in     │
-     │       │ last_error     │
-     │       └────────────────┘
-     │
-     ▼
-┌────────────────┐
-│ Mark as        │
-│ COMPLETED      │
-│                │
-│ Set            │
-│ executed_at    │
-│ = NOW()        │
-└────────────────┘
+┌───────────┐  ┌──────────────┐
+│   HTTP    │  │    NATS      │
+└─────┬─────┘  └──────┬───────┘
+      │               │
+      ▼               ▼
+┌─────────────────────────────────┐  ┌──────────────────────────┐
+│ Build HTTP Request:             │  │ Build NATS Message:      │
+│                                 │  │                          │
+│ Method: POST (hardcoded)        │  │ Subject: topic           │
+│ URL: callback_config.url        │  │ Key: key (optional)      │
+│ Headers:                        │  │ Headers: custom headers  │
+│   - Content-Type: app/json      │  │ Payload: JSON payload    │
+│   - User-Agent: timer-platform  │  │                          │
+│   - Custom headers              │  │ (Fire-and-forget)        │
+│ Body: callback_config.payload   │  │                          │
+│ Timeout: 30 seconds             │  └──────┬───────────────────┘
+└─────────┬───────────────────────┘         │
+          │                                 │
+          ▼                                 ▼
+┌─────────────────┐              ┌──────────────────┐
+│ Send HTTP       │              │ Publish to NATS  │
+│ Request         │              │ (async)          │
+│ (async)         │              └────────┬─────────┘
+└────────┬────────┘                       │
+         │                                │
+         ▼                                ▼
+┌────────────────────┐          ┌──────────────────┐
+│ Wait for Response  │          │ Check publish    │
+│ (max 30s timeout)  │          │ result           │
+└────────┬───────────┘          └────────┬─────────┘
+         │                               │
+  ┌──────┴──────┐                 ┌──────┴──────┐
+  │             │                 │             │
+  ▼             ▼                 ▼             ▼
+┌──────┐  ┌─────────┐      ┌─────────┐  ┌──────────┐
+│2xx OK│  │4xx/5xx  │      │Published│  │Pub Error │
+│      │  │Timeout  │      │         │  │          │
+└──┬───┘  └────┬────┘      └────┬────┘  └────┬─────┘
+   │           │                │           │
+   │           ▼                │           ▼
+   │    ┌────────────┐          │    ┌────────────┐
+   │    │Mark FAILED │          │    │Mark FAILED │
+   │    │Store error │          │    │Store error │
+   │    └────────────┘          │    └────────────┘
+   │                            │
+   └────────────┬───────────────┘
+                ▼
+         ┌────────────────┐
+         │ Mark COMPLETED │
+         │ Set executed_at│
+         └────────────────┘
 ```
 
-**HTTP Request Details**:
+#### HTTP Callback Details
 
 The platform constructs HTTP requests with the following configuration:
 
 - **Method**: Always HTTP POST (hardcoded, not configurable)
 
-- **URL**: The full `callback_url` from the timer. Must be a valid HTTP or HTTPS URL. The platform does not modify or validate the URL structure beyond basic format checks.
+- **URL**: The full `url` from `callback_config.url`. Must be a valid HTTP or HTTPS URL. The platform does not modify or validate the URL structure beyond basic format checks.
 
 - **Headers**:
   - `Content-Type: application/json` - Always sent, as all payloads are JSON
   - `User-Agent: timer-platform/0.1.0` - Identifies the caller
-  - Custom headers from `callback_headers` field - Allows authentication tokens, API keys, or any custom headers the external service requires
+  - Custom headers from `callback_config.headers` field - Allows authentication tokens, API keys, or any custom headers the external service requires
 
-- **Body**: The `callback_payload` JSON object serialized as the request body. Can be any valid JSON structure (object, array, string, number, etc.).
+- **Body**: The `callback_config.payload` JSON object serialized as the request body. Can be any valid JSON structure (object, array, string, number, etc.).
 
 - **Timeout**: Fixed 30-second timeout. If the external service doesn't respond within 30 seconds, the request is canceled and treated as a failure.
 
@@ -1094,6 +1232,34 @@ The platform constructs HTTP requests with the following configuration:
 - Response body ignored (not stored)
 - Timer marked as 'completed'
 - Set executed_at timestamp
+
+#### NATS Callback Details
+
+The platform publishes NATS messages with the following configuration:
+
+- **Subject/Topic**: The NATS subject from `callback_config.topic`. This is the routing key for NATS subscribers (e.g., "events.timer.triggered").
+
+- **Key**: Optional routing key from `callback_config.key`. Can be used by consumers for additional message routing or filtering logic.
+
+- **Headers**: Custom NATS headers from `callback_config.headers`. These are protocol-level headers available to subscribers for metadata, routing, or filtering.
+
+- **Payload**: The `callback_config.payload` JSON object serialized as the message body. Can be any valid JSON structure.
+
+- **Publishing Mode**: Fire-and-forget (async publish). The platform does NOT wait for acknowledgments from subscribers.
+
+- **Connection**: Uses shared NATS client connection established at application startup (configured via `NATS_URL` environment variable).
+
+**Success Criteria**:
+- NATS client successfully publishes message (no connection errors)
+- Timer marked as 'completed'
+- Set executed_at timestamp
+- NOTE: Success does NOT guarantee that any consumer received or processed the message (fire-and-forget semantics)
+
+**NATS Failure Scenarios**:
+- NATS server unreachable (connection lost)
+- Invalid subject/topic format
+- Publish timeout (internal NATS client timeout)
+- All failures result in timer marked as 'failed' with error details in `last_error`
 
 **Failure Handling**:
 
@@ -1169,7 +1335,7 @@ WORKDIR /app
 COPY --from=builder /app/target/release/timer /app/timer
 
 # Expose port
-EXPOSE 3000
+EXPOSE 8080
 
 # Run the binary
 CMD ["/app/timer"]
@@ -1206,18 +1372,36 @@ services:
       timeout: 5s
       retries: 5
 
+  nats:
+    image: nats:2.10-alpine
+    container_name: timer-nats
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    networks:
+      - timer-network
+    command: ["-js", "-m", "8222"]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   timer:
     build: .
     container_name: timer-platform
     environment:
       DATABASE_URL: postgresql://timer:timer123@postgres:5432/timerdb
       API_KEY: dev-api-key-change-in-production
-      PORT: 3000
+      PORT: 8080
       RUST_LOG: info
+      NATS_URL: nats://nats:4222
     ports:
-      - "3000:3000"
+      - "8080:8080"
     depends_on:
       postgres:
+        condition: service_healthy
+      nats:
         condition: service_healthy
     networks:
       - timer-network
@@ -1257,15 +1441,15 @@ CREATE TABLE timers (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     execute_at TIMESTAMPTZ NOT NULL,
-    callback_url TEXT NOT NULL,
-    callback_headers JSONB,
-    callback_payload JSONB,
+    callback_type VARCHAR(10) NOT NULL DEFAULT 'http',
+    callback_config JSONB NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'pending',
     last_error TEXT,
     executed_at TIMESTAMPTZ,
     metadata JSONB,
 
     CONSTRAINT valid_status CHECK (status IN ('pending', 'executing', 'completed', 'failed', 'canceled')),
+    CONSTRAINT valid_callback_type CHECK (callback_type IN ('http', 'nats')),
     CONSTRAINT future_execute_at CHECK (execute_at > created_at)
 );
 
@@ -1276,6 +1460,8 @@ CREATE INDEX idx_timers_execute_at_status ON timers(execute_at, status)
 CREATE INDEX idx_timers_status ON timers(status);
 
 CREATE INDEX idx_timers_created_at ON timers(created_at DESC);
+
+CREATE INDEX idx_timers_callback_type ON timers(callback_type);
 
 -- Create updated_at trigger
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -1332,6 +1518,9 @@ uuid = { version = "1.0", features = ["v7", "serde"] }
 
 # HTTP client for callbacks
 reqwest = { version = "0.11", features = ["json"] }
+
+# NATS client for pub/sub callbacks
+async-nats = "0.33"
 
 # Logging
 tracing = "0.1"
@@ -1421,26 +1610,55 @@ docker-compose up -d
 export API_KEY="dev-api-key-change-in-production"
 ```
 
-**Test 1: Create Timer**
+**Test 1a: Create Timer (HTTP Callback)**
 ```bash
-curl -X POST http://localhost:3000/timers \
+curl -X POST http://localhost:8080/timers \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "execute_at": "2025-10-26T16:00:00Z",
-    "callback_url": "https://webhook.site/your-unique-id",
-    "callback_payload": {
-      "message": "Timer triggered!",
-      "timestamp": "2025-10-26T16:00:00Z"
+    "callback_type": "http",
+    "callback_config": {
+      "type": "http",
+      "url": "https://webhook.site/your-unique-id",
+      "payload": {
+        "message": "Timer triggered!",
+        "timestamp": "2025-10-26T16:00:00Z"
+      }
     }
   }'
 ```
 
-**Expected**: HTTP 201, response with timer ID and status='pending'
+**Expected**: HTTP 201, response with timer ID and status='pending', callback_type='http'
+
+**Test 1b: Create Timer (NATS Callback)**
+```bash
+curl -X POST http://localhost:8080/timers \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "execute_at": "2025-10-26T16:00:00Z",
+    "callback_type": "nats",
+    "callback_config": {
+      "type": "nats",
+      "topic": "events.timer.triggered",
+      "key": "test-key-123",
+      "headers": {
+        "X-Event-Type": "timer_triggered"
+      },
+      "payload": {
+        "message": "Timer triggered via NATS!",
+        "timestamp": "2025-10-26T16:00:00Z"
+      }
+    }
+  }'
+```
+
+**Expected**: HTTP 201, response with timer ID and status='pending', callback_type='nats'
 
 **Test 2: Get Timer**
 ```bash
-curl -X GET http://localhost:3000/timers/{TIMER_ID} \
+curl -X GET http://localhost:8080/timers/{TIMER_ID} \
   -H "X-API-Key: $API_KEY"
 ```
 
@@ -1448,7 +1666,7 @@ curl -X GET http://localhost:3000/timers/{TIMER_ID} \
 
 **Test 3: List Timers**
 ```bash
-curl -X GET "http://localhost:3000/timers?status=pending&limit=10" \
+curl -X GET "http://localhost:8080/timers?status=pending&limit=10" \
   -H "X-API-Key: $API_KEY"
 ```
 
@@ -1456,7 +1674,7 @@ curl -X GET "http://localhost:3000/timers?status=pending&limit=10" \
 
 **Test 4: Update Timer**
 ```bash
-curl -X PUT http://localhost:3000/timers/{TIMER_ID} \
+curl -X PUT http://localhost:8080/timers/{TIMER_ID} \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1468,7 +1686,7 @@ curl -X PUT http://localhost:3000/timers/{TIMER_ID} \
 
 **Test 5: Cancel Timer**
 ```bash
-curl -X DELETE http://localhost:3000/timers/{TIMER_ID} \
+curl -X DELETE http://localhost:8080/timers/{TIMER_ID} \
   -H "X-API-Key: $API_KEY"
 ```
 
@@ -1476,14 +1694,14 @@ curl -X DELETE http://localhost:3000/timers/{TIMER_ID} \
 
 **Test 6: Health Check**
 ```bash
-curl -X GET http://localhost:3000/health
+curl -X GET http://localhost:8080/health
 ```
 
 **Expected**: HTTP 200, status='up', database='connected'
 
 **Test 7: Authentication Failure**
 ```bash
-curl -X GET http://localhost:3000/timers \
+curl -X GET http://localhost:8080/timers \
   -H "X-API-Key: wrong-key"
 ```
 
@@ -1494,7 +1712,7 @@ curl -X GET http://localhost:3000/timers \
 # Create timer with execute_at in 10 seconds
 FUTURE_TIME=$(date -u -v+10S +"%Y-%m-%dT%H:%M:%SZ")
 
-curl -X POST http://localhost:3000/timers \
+curl -X POST http://localhost:8080/timers \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d "{
@@ -1505,7 +1723,7 @@ curl -X POST http://localhost:3000/timers \
 
 # Wait 15 seconds, then check timer status
 sleep 15
-curl -X GET http://localhost:3000/timers/{TIMER_ID} \
+curl -X GET http://localhost:8080/timers/{TIMER_ID} \
   -H "X-API-Key: $API_KEY"
 ```
 
@@ -1514,7 +1732,7 @@ curl -X GET http://localhost:3000/timers/{TIMER_ID} \
 **Test 9: Failure Handling** (requires failing webhook)
 ```bash
 # Create timer with invalid URL to test failure handling
-curl -X POST http://localhost:3000/timers \
+curl -X POST http://localhost:8080/timers \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1563,7 +1781,7 @@ Integration tests should cover the following scenarios:
 
 **Issue**: Timer not executing at expected time
 - **Debugging**:
-  1. Check timer status: `curl -H "X-API-Key: $API_KEY" http://localhost:3000/timers/{ID}`
+  1. Check timer status: `curl -H "X-API-Key: $API_KEY" http://localhost:8080/timers/{ID}`
   2. Verify execute_at is in past: Compare execute_at to current UTC time
   3. Check scheduler logs: `docker-compose logs -f timer | grep scheduler`
   4. Verify scheduler interval: Check `SCHEDULER_INTERVAL_SECS` environment variable
@@ -1655,7 +1873,7 @@ The application follows a sequential startup process to ensure all components ar
    ├─ Read .env file (if exists)
    ├─ Parse DATABASE_URL (required)
    ├─ Parse API_KEY (required)
-   ├─ Parse PORT (optional, default: 3000)
+   ├─ Parse PORT (optional, default: 8080)
    └─ Parse RUST_LOG (optional, default: info)
    │
    ▼
@@ -1689,7 +1907,15 @@ The application follows a sequential startup process to ensure all components ar
    └─ Create triggers (updated_at auto-update)
    │
    ▼
-6. Start Scheduler Tasks
+6. Connect to NATS (Optional)
+   │
+   ├─ Check if NATS_URL is configured
+   ├─ If yes: Connect to NATS server
+   ├─ Store shared client in AppState
+   └─ If no: Set nats_client to None (HTTP-only mode)
+   │
+   ▼
+7. Start Scheduler Tasks
    │
    ├─ Initialize in-memory cache (empty HashMap)
    ├─ Spawn memory loader task (30s interval)
@@ -1697,17 +1923,17 @@ The application follows a sequential startup process to ensure all components ar
    └─ Share cache reference in AppState (used only by scheduler)
    │
    ▼
-7. Build API Router
+8. Build API Router
    │
    ├─ Mount API endpoints (/timers, /health)
    ├─ Add authentication middleware (X-API-Key)
    ├─ Add tracing middleware (request logging)
-   └─ Attach shared state (pool, config, cache)
+   └─ Attach shared state (pool, config, cache, nats_client)
    │
    ▼
-8. Start HTTP Server
+9. Start HTTP Server
    │
-   ├─ Bind to 0.0.0.0:{PORT}
+   ├─ Bind to 0.0.0.0:8080 (or custom PORT)
    ├─ Log startup message
    └─ Begin accepting connections
    │
@@ -1724,6 +1950,8 @@ The application follows a sequential startup process to ensure all components ar
 - **Scheduler Independence**: The scheduler tasks run independently of the API server. Even if the API is overloaded, timers continue to execute.
 
 - **Shared State**: The in-memory cache is wrapped in `Arc<RwLock<>>` for thread-safe access by scheduler tasks. API handlers do NOT interact with the cache - they only read/write to PostgreSQL. Only the Memory Loader task writes to cache, and the Execution task reads from it.
+
+- **NATS Connection**: The NATS client connection is optional. If `NATS_URL` is not configured, the application runs in HTTP-only mode. NATS timers created without NATS connection will fail validation at creation time. The NATS client is wrapped in `Arc<>` for thread-safe sharing across tasks.
 
 ### Scheduler Implementation
 
@@ -1770,18 +1998,26 @@ The scheduler consists of two independent Tokio tasks that run concurrently in i
 
 ### Callback Execution Implementation
 
-The callback execution logic is encapsulated in a dedicated module that handles the HTTP request construction, execution, and result processing.
+The callback execution logic is encapsulated in dedicated modules that handle both HTTP and NATS callback types.
 
-**Callback Handler Responsibilities**:
+**Callback Dispatcher Responsibilities**:
+
+1. **Type Detection**: Check timer's `callback_type` field to determine execution path
+
+2. **Route to Handler**:
+   - HTTP: Delegate to `callback_http` module
+   - NATS: Delegate to `callback_nats` module
+
+**HTTP Callback Handler** (`callback_http.rs`):
 
 1. **HTTP Client Setup**: Creates a configured HTTP client with 30-second timeout
 
 2. **Request Construction**:
    - Set HTTP method to POST (hardcoded)
-   - Set URL from timer's `callback_url`
+   - Set URL from `callback_config.url`
    - Add standard headers (`Content-Type`, `User-Agent`)
-   - Merge custom headers from timer's `callback_headers` JSONB field
-   - Serialize `callback_payload` as JSON body (if present)
+   - Merge custom headers from `callback_config.headers` JSONB field
+   - Serialize `callback_config.payload` as JSON body (if present)
 
 3. **Request Execution**: Send HTTP request asynchronously using reqwest
 
@@ -1789,7 +2025,27 @@ The callback execution logic is encapsulated in a dedicated module that handles 
    - **Success (2xx status)**: Update timer status to `COMPLETED`, set `executed_at` timestamp, log success
    - **Failure (non-2xx or error)**: Mark as `FAILED`, store error message, set `executed_at` timestamp, log warning
 
-5. **Failure Handler**:
+**NATS Callback Handler** (`callback_nats.rs`):
+
+1. **Client Validation**: Check that `AppState.nats_client` is Some (fail if None)
+
+2. **Message Construction**:
+   - Extract topic from `callback_config.topic`
+   - Extract optional key from `callback_config.key`
+   - Extract headers from `callback_config.headers` JSONB field
+   - Serialize `callback_config.payload` as JSON
+
+3. **Message Publishing**:
+   - Use shared NATS client from AppState
+   - Publish message to topic with async-nats client
+   - Apply NATS headers if provided
+   - Fire-and-forget semantics (no waiting for subscriber ACK)
+
+4. **Result Handling**:
+   - **Success (published without error)**: Update timer status to `COMPLETED`, set `executed_at` timestamp, log success
+   - **Failure (publish error)**: Mark as `FAILED`, store error message (connection error, invalid topic, etc.), set `executed_at` timestamp, log warning
+
+**Failure Handler (Common)**:
    - Store error details in `last_error` field
    - Mark timer status as `FAILED`
    - Set `executed_at` to record when the failure occurred
@@ -1840,22 +2096,34 @@ All error responses follow the standard `ApiResponse<T>` format with `data: null
 ## Integration
 
 **Outbound (Callbacks)**:
-- HTTP POST to `callback_url` with JSON payload (method hardcoded)
-- Custom headers via `callback_headers`
-- 30s timeout (fixed)
-- Single execution attempt per timer
-- 2xx = success (completed), 4xx/5xx/network error = failure (failed)
+
+- **HTTP Callbacks**:
+  - HTTP POST to `callback_config.url` with JSON payload (method hardcoded)
+  - Custom headers via `callback_config.headers`
+  - 30s timeout (fixed)
+  - Single execution attempt per timer
+  - 2xx = success (completed), 4xx/5xx/network error = failure (failed)
+
+- **NATS Callbacks**:
+  - Publish JSON message to `callback_config.topic`
+  - Optional routing key via `callback_config.key`
+  - Custom NATS headers via `callback_config.headers`
+  - Fire-and-forget semantics (no ACK waiting)
+  - Single publish attempt per timer
+  - Successful publish = success (completed), connection/publish error = failure (failed)
 
 **Inbound (API)**:
 - RESTful HTTP API with `X-API-Key` authentication
 - JSON request/response bodies
 - 6 endpoints: create, get, list, update, cancel, health
+- Supports both HTTP and NATS callback configurations
 - See API Endpoints section for full details
 
 **Service Dependencies**:
-- PostgreSQL 15+ (required) - Must be running and accessible
+- **PostgreSQL 15+** (required) - Must be running and accessible for all operations
+- **NATS Server 2.x** (optional) - Required only if using NATS callbacks. HTTP callbacks work without NATS.
 - No other microservices required (standalone service)
-- No Redis, message queues, or external caches needed
+- No Redis, message queues (other than NATS), or external caches needed
 
 ## Production Considerations
 

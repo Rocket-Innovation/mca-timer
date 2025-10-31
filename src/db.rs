@@ -4,35 +4,34 @@ use serde_json::Value;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
-use crate::models::Timer;
+use crate::models::{CallbackConfig, CallbackType, Timer};
 
 /// Create a new timer
 pub async fn db_create_timer(
     pool: &PgPool,
     execute_at: DateTime<Utc>,
-    callback_url: String,
-    callback_headers: Option<Value>,
-    callback_payload: Option<Value>,
+    callback_type: CallbackType,
+    callback_config: CallbackConfig,
     metadata: Option<Value>,
 ) -> Result<Timer> {
+    // Serialize callback_config to JSON
+    let callback_config_json = serde_json::to_value(&callback_config)?;
+
     let timer = sqlx::query_as::<_, Timer>(
         r#"
         INSERT INTO timers (
-            id, execute_at, callback_url, callback_headers,
-            callback_payload, metadata, status
+            id, execute_at, callback_type, callback_config, metadata, status
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        VALUES ($1, $2, $3, $4, $5, $6)
         RETURNING
-            id, created_at, updated_at, execute_at, callback_url,
-            callback_headers, callback_payload,
-            status, last_error, executed_at, metadata
+            id, created_at, updated_at, execute_at, callback_type,
+            callback_config, status, last_error, executed_at, metadata
         "#,
     )
     .bind(Uuid::new_v4())
     .bind(execute_at)
-    .bind(callback_url)
-    .bind(callback_headers)
-    .bind(callback_payload)
+    .bind(callback_type)
+    .bind(callback_config_json)
     .bind(metadata)
     .bind("pending")
     .fetch_one(pool)
@@ -46,9 +45,8 @@ pub async fn db_get_timer(pool: &PgPool, timer_id: Uuid) -> Result<Option<Timer>
     let timer = sqlx::query_as::<_, Timer>(
         r#"
         SELECT
-            id, created_at, updated_at, execute_at, callback_url,
-            callback_headers, callback_payload,
-            status, last_error, executed_at, metadata
+            id, created_at, updated_at, execute_at, callback_type,
+            callback_config, status, last_error, executed_at, metadata
         FROM timers
         WHERE id = $1
         "#,
@@ -83,9 +81,8 @@ pub async fn db_list_timers(
     let query = format!(
         r#"
         SELECT
-            id, created_at, updated_at, execute_at, callback_url,
-            callback_headers, callback_payload,
-            status, last_error, executed_at, metadata
+            id, created_at, updated_at, execute_at, callback_type,
+            callback_config, status, last_error, executed_at, metadata
         FROM timers
         {}
         {}
@@ -114,9 +111,8 @@ pub async fn db_update_timer(
     pool: &PgPool,
     timer_id: Uuid,
     execute_at: Option<DateTime<Utc>>,
-    callback_url: Option<String>,
-    callback_headers: Option<Value>,
-    callback_payload: Option<Value>,
+    callback_type: Option<CallbackType>,
+    callback_config: Option<CallbackConfig>,
     metadata: Option<Value>,
 ) -> Result<Timer> {
     // Build dynamic update query
@@ -127,16 +123,12 @@ pub async fn db_update_timer(
         updates.push(format!("execute_at = ${}", param_index));
         param_index += 1;
     }
-    if callback_url.is_some() {
-        updates.push(format!("callback_url = ${}", param_index));
+    if callback_type.is_some() {
+        updates.push(format!("callback_type = ${}", param_index));
         param_index += 1;
     }
-    if callback_headers.is_some() {
-        updates.push(format!("callback_headers = ${}", param_index));
-        param_index += 1;
-    }
-    if callback_payload.is_some() {
-        updates.push(format!("callback_payload = ${}", param_index));
+    if callback_config.is_some() {
+        updates.push(format!("callback_config = ${}", param_index));
         param_index += 1;
     }
     if metadata.is_some() {
@@ -146,9 +138,8 @@ pub async fn db_update_timer(
     let query = format!(
         r#"UPDATE timers SET {} WHERE id = $1
         RETURNING
-            id, created_at, updated_at, execute_at, callback_url,
-            callback_headers, callback_payload,
-            status, last_error, executed_at, metadata
+            id, created_at, updated_at, execute_at, callback_type,
+            callback_config, status, last_error, executed_at, metadata
         "#,
         updates.join(", ")
     );
@@ -159,14 +150,12 @@ pub async fn db_update_timer(
     if let Some(ea) = execute_at {
         q = q.bind(ea);
     }
-    if let Some(url) = callback_url {
-        q = q.bind(url);
+    if let Some(ct) = callback_type {
+        q = q.bind(ct);
     }
-    if let Some(headers) = callback_headers {
-        q = q.bind(headers);
-    }
-    if let Some(payload) = callback_payload {
-        q = q.bind(payload);
+    if let Some(cc) = callback_config {
+        let cc_json = serde_json::to_value(&cc)?;
+        q = q.bind(cc_json);
     }
     if let Some(meta) = metadata {
         q = q.bind(meta);
@@ -184,9 +173,8 @@ pub async fn db_cancel_timer(pool: &PgPool, timer_id: Uuid) -> Result<Timer> {
         SET status = $2, updated_at = NOW()
         WHERE id = $1
         RETURNING
-            id, created_at, updated_at, execute_at, callback_url,
-            callback_headers, callback_payload,
-            status, last_error, executed_at, metadata
+            id, created_at, updated_at, execute_at, callback_type,
+            callback_config, status, last_error, executed_at, metadata
         "#,
     )
     .bind(timer_id)
@@ -203,9 +191,8 @@ pub async fn db_load_near_term_timers(pool: &PgPool) -> Result<Vec<Timer>> {
     let timers = sqlx::query_as::<_, Timer>(
         r#"
         SELECT
-            id, created_at, updated_at, execute_at, callback_url,
-            callback_headers, callback_payload,
-            status, last_error, executed_at, metadata
+            id, created_at, updated_at, execute_at, callback_type,
+            callback_config, status, last_error, executed_at, metadata
         FROM timers
         WHERE status = $1
         AND execute_at > NOW() - INTERVAL '5 minutes'

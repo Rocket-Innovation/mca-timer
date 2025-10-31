@@ -1,3 +1,4 @@
+use async_nats::Client as NatsClient;
 use chrono::Utc;
 use sqlx::PgPool;
 use tokio::time::{interval, Duration};
@@ -9,7 +10,7 @@ use crate::models::TimerCache;
 /// Start the scheduler with two background tasks:
 /// - Memory Loader (runs every 30s)
 /// - Execution Task (runs every 1s)
-pub fn start_scheduler(pool: PgPool, cache: TimerCache) {
+pub fn start_scheduler(pool: PgPool, cache: TimerCache, nats_client: Option<NatsClient>) {
     // Clone for memory loader task
     let pool_loader = pool.clone();
     let cache_loader = cache.clone();
@@ -17,6 +18,7 @@ pub fn start_scheduler(pool: PgPool, cache: TimerCache) {
     // Clone for execution task
     let pool_executor = pool.clone();
     let cache_executor = cache.clone();
+    let nats_executor = nats_client.clone();
 
     // Spawn Memory Loader Task (30s interval)
     tokio::spawn(async move {
@@ -75,6 +77,7 @@ pub fn start_scheduler(pool: PgPool, cache: TimerCache) {
             for timer in due_timers {
                 let timer_id = timer.id;
                 let pool_clone = pool_executor.clone();
+                let nats_clone = nats_executor.clone();
 
                 // Mark as executing in database
                 match db_mark_executing(&pool_executor, timer_id).await {
@@ -86,13 +89,7 @@ pub fn start_scheduler(pool: PgPool, cache: TimerCache) {
                         tokio::spawn(async move {
                             tracing::info!("Spawned callback for timer {}", timer_id);
 
-                            if let Err(err) = execute_callback(&pool_clone, timer).await {
-                                tracing::error!(
-                                    "Failed to execute callback for timer {}: {}",
-                                    timer_id,
-                                    err
-                                );
-                            }
+                            execute_callback(&pool_clone, timer, nats_clone.as_ref()).await;
                         });
                     }
                     Err(err) => {

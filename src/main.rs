@@ -6,6 +6,8 @@ mod api_list_timers;
 mod api_update_timer;
 mod auth;
 mod callback;
+mod callback_http;
+mod callback_nats;
 mod config;
 mod db;
 mod models;
@@ -70,17 +72,36 @@ async fn main() {
     let timer_cache = Arc::new(RwLock::new(HashMap::new()));
     tracing::info!("In-memory cache initialized");
 
-    // Step 6: Start scheduler
-    scheduler::start_scheduler(pool.clone(), timer_cache.clone());
+    // Step 6: Initialize NATS client (optional)
+    let nats_client = if let Some(nats_url) = &config.nats_url {
+        tracing::info!("Connecting to NATS at {}", nats_url);
+        match async_nats::connect(nats_url).await {
+            Ok(client) => {
+                tracing::info!("NATS connection established");
+                Some(client)
+            }
+            Err(e) => {
+                tracing::error!("Failed to connect to NATS: {}", e);
+                panic!("NATS connection failed: {}", e);
+            }
+        }
+    } else {
+        tracing::info!("NATS_URL not configured, NATS callbacks disabled");
+        None
+    };
 
-    // Step 7: Create shared AppState
+    // Step 7: Start scheduler
+    scheduler::start_scheduler(pool.clone(), timer_cache.clone(), nats_client.clone());
+
+    // Step 8: Create shared AppState
     let state = Arc::new(AppState {
         pool,
         config: config.clone(),
         timer_cache,
+        nats_client,
     });
 
-    // Step 8: Build router with protected and public routes
+    // Step 9: Build router with protected and public routes
     let protected_routes = Router::new()
         .route("/timers", post(api_create_timer::create_timer))
         .route("/timers", get(api_list_timers::list_timers))
@@ -98,7 +119,7 @@ async fn main() {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    // Step 9: Start HTTP server
+    // Step 10: Start HTTP server
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     tracing::info!("Server listening on {}", addr);
 

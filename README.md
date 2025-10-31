@@ -48,7 +48,7 @@ docker run -d \
 cargo run
 ```
 
-The service will be available at `http://localhost:3000`
+The service will be available at `http://localhost:8080`
 
 ### Docker Deployment
 
@@ -155,7 +155,7 @@ Environment variables:
 |----------|----------|---------|-------------|
 | `DATABASE_URL` | Yes | - | PostgreSQL connection string |
 | `API_KEY` | Yes | - | API authentication key (min 32 chars) |
-| `PORT` | No | 3000 | HTTP server port |
+| `PORT` | No | 8080 | HTTP server port |
 | `RUST_LOG` | No | info | Logging level (trace, debug, info, warn, error) |
 
 ## Architecture
@@ -259,7 +259,7 @@ sqlx migrate revert
 ### Health Check
 
 ```bash
-curl http://localhost:3000/health
+curl http://localhost:8080/health
 ```
 
 Successful response:
@@ -316,7 +316,7 @@ docker-compose exec postgres psql -U timer -d timerdb -c "SELECT 1"
 
 Check timer's `last_error` field for error details:
 ```bash
-curl -H "X-API-Key: your-api-key" http://localhost:3000/timers/{id}
+curl -H "X-API-Key: your-api-key" http://localhost:8080/timers/{id}
 ```
 
 ## Production Considerations
