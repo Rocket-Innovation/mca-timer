@@ -40,9 +40,14 @@ services:
     build: .
     container_name: timer-platform
     environment:
-      DATABASE_URL: postgresql://timer:timer123@postgres:5432/timerdb
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_USER: timer
+      PG_PASSWORD: timer123
+      PG_DB_NAME: timerdb
       API_KEY: dev-api-key-change-in-production-min-32-chars
-      NATS_URL: nats://nats:4222
+      NATS_HOST: nats
+      NATS_PORT: 4222
       PORT: 8080
       RUST_LOG: info
     ports:

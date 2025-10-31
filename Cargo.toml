@@ -35,6 +35,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Environment variables
 dotenvy = "0.15"
+urlencoding = "2.1"
 
 # Error handling
 anyhow = "1.0"

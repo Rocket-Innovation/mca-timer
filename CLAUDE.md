@@ -111,7 +111,7 @@ src/
 ├── api_list_timers.rs   // GET /timers (ListTimersResponse, query params, handler)
 ├── api_update_timer.rs  // PUT /timers/:id (UpdateTimerRequest, handler)
 ├── api_cancel_timer.rs  // DELETE /timers/:id (handler)
-├── api_health.rs        // GET /health (HealthResponse, handler)
+├── api_health.rs        // GET /healthz (HealthResponse, handler)
 └── auth.rs              // Authentication middleware
 ```
 
@@ -408,21 +408,54 @@ async fn auth_middleware(
 ## Environment Variables
 
 **Required**:
-- `DATABASE_URL` - PostgreSQL connection string (format: `postgresql://user:pass@host:port/dbname`)
 - `API_KEY` - Authentication key for API access (minimum 32 characters recommended)
+
+**Database Configuration** (required):
+- `PG_HOST` - PostgreSQL server hostname (e.g., `localhost`)
+- `PG_PORT` - PostgreSQL server port (default: `5432`)
+- `PG_USER` - PostgreSQL username
+- `PG_PASSWORD` - PostgreSQL password
+- `PG_DB_NAME` - PostgreSQL database name
+- `DATABASE_URL` - Direct PostgreSQL connection URL (alternative to component-based config, for backward compatibility)
 
 **Optional**:
 - `PORT` - HTTP server port (default: `8080`)
 - `RUST_LOG` - Logging level (default: `info`)
-- `NATS_URL` - NATS server connection string (default: `nats://localhost:4222`). Required only if NATS callbacks are used.
+
+**NATS Configuration** (optional, enables NATS callbacks):
+- `NATS_HOST` - NATS server hostname (e.g., `localhost`)
+- `NATS_PORT` - NATS server port (default: `4222`)
+- `NATS_USER` - NATS username for authentication (optional)
+- `NATS_PASSWORD` - NATS password for authentication (optional)
+- `NATS_URL` - Direct NATS connection URL (alternative to component-based config, for backward compatibility)
 
 **Example `.env` file**:
 ```env
-DATABASE_URL=postgresql://timer:timer123@localhost:5432/timerdb
+# Database configuration (component-based, recommended)
+PG_HOST=localhost
+PG_PORT=5432
+PG_USER=timer
+PG_PASSWORD=timer123
+PG_DB_NAME=timerdb
+
+# Or use direct URL (backward compatibility)
+# DATABASE_URL=postgresql://timer:timer123@localhost:5432/timerdb
+
+# API key
 API_KEY=my-super-secret-api-key-at-least-32-chars-long
+
+# Server configuration
 PORT=8080
 RUST_LOG=info
-NATS_URL=nats://localhost:4222
+
+# NATS configuration (component-based, recommended)
+NATS_HOST=localhost
+NATS_PORT=4222
+NATS_USER=
+NATS_PASSWORD=
+
+# Or use direct URL (backward compatibility)
+# NATS_URL=nats://localhost:4222
 ```
 
 **Hard-coded defaults** (not configurable in MVP):
@@ -876,7 +909,7 @@ X-API-Key: your-api-key
 
 ### Health Check
 ```
-GET /health
+GET /healthz
 ```
 
 **Description**: Check service health and database connectivity
@@ -1391,11 +1424,16 @@ services:
     build: .
     container_name: timer-platform
     environment:
-      DATABASE_URL: postgresql://timer:timer123@postgres:5432/timerdb
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_USER: timer
+      PG_PASSWORD: timer123
+      PG_DB_NAME: timerdb
       API_KEY: dev-api-key-change-in-production
       PORT: 8080
       RUST_LOG: info
-      NATS_URL: nats://nats:4222
+      NATS_HOST: nats
+      NATS_PORT: 4222
     ports:
       - "8080:8080"
     depends_on:
@@ -1694,7 +1732,7 @@ curl -X DELETE http://localhost:8080/timers/{TIMER_ID} \
 
 **Test 6: Health Check**
 ```bash
-curl -X GET http://localhost:8080/health
+curl -X GET http://localhost:8080/healthz
 ```
 
 **Expected**: HTTP 200, status='up', database='connected'
@@ -1871,7 +1909,9 @@ The application follows a sequential startup process to ensure all components ar
 1. Load Environment Variables
    │
    ├─ Read .env file (if exists)
-   ├─ Parse DATABASE_URL (required)
+   ├─ Build DATABASE_URL from components or use direct URL
+   │  ├─ Check DATABASE_URL (direct URL, backward compatibility)
+   │  └─ Or build from PG_HOST, PG_PORT, PG_USER, PG_PASSWORD, PG_DB_NAME
    ├─ Parse API_KEY (required)
    ├─ Parse PORT (optional, default: 8080)
    └─ Parse RUST_LOG (optional, default: info)
@@ -1909,10 +1949,12 @@ The application follows a sequential startup process to ensure all components ar
    ▼
 6. Connect to NATS (Optional)
    │
-   ├─ Check if NATS_URL is configured
-   ├─ If yes: Connect to NATS server
+   ├─ Build NATS URL from environment variables
+   │  ├─ Check NATS_URL (direct URL, backward compatibility)
+   │  └─ Or build from NATS_HOST, NATS_PORT, NATS_USER, NATS_PASSWORD
+   ├─ If configured: Connect to NATS server
    ├─ Store shared client in AppState
-   └─ If no: Set nats_client to None (HTTP-only mode)
+   └─ If not configured: Set nats_client to None (HTTP-only mode)
    │
    ▼
 7. Start Scheduler Tasks
@@ -1925,7 +1967,7 @@ The application follows a sequential startup process to ensure all components ar
    ▼
 8. Build API Router
    │
-   ├─ Mount API endpoints (/timers, /health)
+   ├─ Mount API endpoints (/timers, /healthz)
    ├─ Add authentication middleware (X-API-Key)
    ├─ Add tracing middleware (request logging)
    └─ Attach shared state (pool, config, cache, nats_client)

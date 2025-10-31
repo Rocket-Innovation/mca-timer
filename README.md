@@ -67,7 +67,7 @@ docker-compose down
 
 ### Authentication
 
-All API endpoints (except `/health`) require the `X-API-Key` header:
+All API endpoints (except `/healthz`) require the `X-API-Key` header:
 
 ```bash
 X-API-Key: your-api-key-here
@@ -144,7 +144,7 @@ X-API-Key: your-api-key
 
 #### Health Check
 ```bash
-GET /health
+GET /healthz
 ```
 
 ## Configuration
@@ -153,10 +153,22 @@ Environment variables:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `DATABASE_URL` | Yes | - | PostgreSQL connection string |
 | `API_KEY` | Yes | - | API authentication key (min 32 chars) |
+| `PG_HOST` | Yes* | - | PostgreSQL server hostname |
+| `PG_PORT` | No | 5432 | PostgreSQL server port |
+| `PG_USER` | Yes* | - | PostgreSQL username |
+| `PG_PASSWORD` | Yes* | - | PostgreSQL password |
+| `PG_DB_NAME` | Yes* | - | PostgreSQL database name |
+| `DATABASE_URL` | Yes* | - | Direct PostgreSQL URL (alternative to component config) |
 | `PORT` | No | 8080 | HTTP server port |
 | `RUST_LOG` | No | info | Logging level (trace, debug, info, warn, error) |
+| `NATS_HOST` | No | - | NATS server hostname (enables NATS callbacks) |
+| `NATS_PORT` | No | 4222 | NATS server port |
+| `NATS_USER` | No | - | NATS username for authentication |
+| `NATS_PASSWORD` | No | - | NATS password for authentication |
+| `NATS_URL` | No | - | Direct NATS URL (alternative to component config) |
+
+*Either `DATABASE_URL` OR the `PG_*` variables are required (not both)
 
 ## Architecture
 
@@ -259,7 +271,7 @@ sqlx migrate revert
 ### Health Check
 
 ```bash
-curl http://localhost:8080/health
+curl http://localhost:8080/healthz
 ```
 
 Successful response:

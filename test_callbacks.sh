@@ -12,7 +12,7 @@ echo "=== Timer Platform Callback Test Suite ==="
 echo ""
 
 # Get current UTC time
-CURRENT_TIME=$(curl -s $BASE_URL/health | jq -r '.data.timestamp')
+CURRENT_TIME=$(curl -s $BASE_URL/healthz | jq -r '.data.timestamp')
 echo "Current UTC time: $CURRENT_TIME"
 echo ""
 

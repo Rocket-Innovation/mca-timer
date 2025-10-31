@@ -73,9 +73,20 @@ async fn main() {
     tracing::info!("In-memory cache initialized");
 
     // Step 6: Initialize NATS client (optional)
-    let nats_client = if let Some(nats_url) = &config.nats_url {
+    let nats_client = if let Some(nats_config) = &config.nats_config {
+        let nats_url = format!("nats://{}:{}", nats_config.host, nats_config.port);
         tracing::info!("Connecting to NATS at {}", nats_url);
-        match async_nats::connect(nats_url).await {
+
+        // Build connection options
+        let mut options = async_nats::ConnectOptions::new();
+
+        // Add authentication if credentials provided
+        if let (Some(user), Some(password)) = (&nats_config.user, &nats_config.password) {
+            tracing::info!("Using NATS authentication for user: {}", user);
+            options = options.user_and_password(user.clone(), password.clone());
+        }
+
+        match options.connect(&nats_url).await {
             Ok(client) => {
                 tracing::info!("NATS connection established");
                 Some(client)
@@ -86,7 +97,7 @@ async fn main() {
             }
         }
     } else {
-        tracing::info!("NATS_URL not configured, NATS callbacks disabled");
+        tracing::info!("NATS not configured, NATS callbacks disabled");
         None
     };
 
@@ -115,7 +126,7 @@ async fn main() {
 
     let app = Router::new()
         .merge(protected_routes)
-        .route("/health", get(api_health::health_check))
+        .route("/healthz", get(api_health::health_check))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
