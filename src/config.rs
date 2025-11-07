@@ -75,7 +75,7 @@ impl Config {
     /// Build database URL from environment variables
     ///
     /// Uses component-based configuration:
-    /// PG_HOST, PG_PORT, PG_USER, PG_PASSWORD, PG_DB_NAME
+    /// PG_HOST, PG_PORT, PG_USER, PG_PASSWORD, PG_DB_NAME, PG_SSLMODE
     ///
     /// Returns error if required variables are not set
     fn build_database_url() -> Result<String> {
@@ -96,14 +96,18 @@ impl Config {
         let pg_db_name = env::var("PG_DB_NAME")
             .context("PG_DB_NAME is required")?;
 
+        // Optional SSL mode (defaults to "disable" if not specified)
+        let pg_sslmode = env::var("PG_SSLMODE")
+            .unwrap_or_else(|_| "disable".to_string());
+
         // URL encode credentials to handle special characters
         let encoded_user = urlencoding::encode(&pg_user);
         let encoded_password = urlencoding::encode(&pg_password);
 
-        // Build PostgreSQL connection URL
+        // Build PostgreSQL connection URL with SSL mode
         let url = format!(
-            "postgresql://{}:{}@{}:{}/{}",
-            encoded_user, encoded_password, pg_host, pg_port, pg_db_name
+            "postgresql://{}:{}@{}:{}/{}?sslmode={}",
+            encoded_user, encoded_password, pg_host, pg_port, pg_db_name, pg_sslmode
         );
 
         Ok(url)
