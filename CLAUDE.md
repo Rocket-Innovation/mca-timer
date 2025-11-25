@@ -451,8 +451,15 @@ CMD ["/app/timer"]
 ## Related Services
 
 This service is standalone and does not directly integrate with other MCA services. It's used by:
-- **mca-automation-workflow** - May use timers for delayed workflow execution
+- **[mca-automation-workflow](../mca-automation-workflow/CLAUDE.md)** - May use timers for delayed workflow execution
 - **External systems** - Any service needing scheduled callbacks
+
+**Other MCA Services:**
+- **[mca-front-end](../mca-front-end/CLAUDE.md)** - React workflow builder UI
+- **[mca-bigQuery](../mca-bigQuery/CLAUDE.md)** - PostgreSQL query service
+- **[mca-notification](../mca-notification/CLAUDE.md)** - LINE notification worker
+- **[mca-engine-sdk](../mca-engine-sdk/CLAUDE.md)** - Spider-Go workflow SDK
+- **[roc-argocd](../roc-argocd/CLAUDE.md)** - Kubernetes deployment
 
 ---
 
